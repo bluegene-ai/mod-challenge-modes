@@ -33,6 +33,7 @@ ChallengeModes.Enable = 1
 #    <Challenge>.TitleRewards = ""
 #        Rewards titles for players when reaching the given levels with the challenge enabled.
 #        The IDs used are from CharTitles.dbc. The format is the level followed by the title ID, separated by commas.
+#        Multiple entries for the same level are all granted; the last one becomes the active title.
 #        Example: <Challenge>.TitleRewards = "60 143, 70 123, 80 145"
 #    <Challenge>.XPMultiplier = ""
 #        Multiplies XP the player gains if this challege is enabled. This is a multiplier values, so bonus are applied multiplicatively.
@@ -41,11 +42,13 @@ ChallengeModes.Enable = 1
 #    <Challenge>.TalentRewards = ""
 #        Rewards talent points for players when reaching the given levels with the challenge enabled.
 #        The format is the level followed by the number of talent points given at that level, separated by commas.
+#        Multiple entries for the same level are summed.
 #        Example: <Challenge>.TalentRewards = "30 1, 35 1, 40 1, 45 1, 50 1, 60 2, 70 2, 80 5"
 #    <Challenge>.ItemRewards = ""
 #        Rewards items for players when reaching the given levels with the challenge enabled.
 #        The IDs used are item entry IDs. The format is the level followed by the item ID, separated by commas.
-#        Example: <Challenge>.ItemRewards = "80 54811"
+#        Multiple entries for the same level are all sent, in one mail.
+#        Example: <Challenge>.ItemRewards = "80 54811, 80 40586"
 #    <Challenge>.DisableLevel = ""
 #        When the player reaches this level, the challenge will be automatically disabled.
 #        To never disable a challenge, set to 0.
@@ -56,6 +59,7 @@ ChallengeModes.Enable = 1
 #    <Challenge>.AchievementReward = ""
 #        Rewards an achievement for players when reaching the given levels with the challenge enabled.
 #        The IDs used are achievement entry IDs. The format is the level followed by the achievement ID, separated by commas.
+#        Multiple entries for the same level are all granted.
 #        Example: <Challenge>.AchievementReward = "80 1234"
 #
 

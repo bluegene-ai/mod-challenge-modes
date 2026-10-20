@@ -13,6 +13,8 @@
 #include "GameObjectAI.h"
 #include "Pet.h"
 #include <map>
+#include <unordered_map>
+#include <vector>
 
 
 enum ChallengeModeSettings
@@ -45,12 +47,12 @@ public:
     bool challengesEnabled, hardcoreEnable, semiHardcoreEnable, selfCraftedEnable, itemQualityLevelEnable, slowXpGainEnable, verySlowXpGainEnable, questXpOnlyEnable, ironManEnable;
     uint32 hardcoreDisableLevel, semiHardcoreDisableLevel, selfCraftedDisableLevel, itemQualityLevelDisableLevel, slowXpGainDisableLevel, verySlowXpGainDisableLevel, questXpOnlyDisableLevel, ironManDisableLevel, hardcoreItemRewardAmount, semiHardcoreItemRewardAmount, selfCraftedItemRewardAmount, itemQualityLevelItemRewardAmount, slowXpGainItemRewardAmount, verySlowXpGainItemRewardAmount, questXpOnlyItemRewardAmount, ironManItemRewardAmount;
     float hardcoreXpBonus, semiHardcoreXpBonus, selfCraftedXpBonus, itemQualityLevelXpBonus, questXpOnlyXpBonus, slowXpGainBonus, verySlowXpGainBonus, ironManXpBonus;
-    std::unordered_map<uint8, uint32> hardcoreTitleRewards, semiHardcoreTitleRewards, selfCraftedTitleRewards, itemQualityLevelTitleRewards, slowXpGainTitleRewards, verySlowXpGainTitleRewards, questXpOnlyTitleRewards, ironManTitleRewards;
-    std::unordered_map<uint8, uint32> hardcoreItemRewards, semiHardcoreItemRewards, selfCraftedItemRewards, itemQualityLevelItemRewards, slowXpGainItemRewards, verySlowXpGainItemRewards, questXpOnlyItemRewards, ironManItemRewards;
-    std::unordered_map<uint8, uint32> hardcoreTalentRewards, semiHardcoreTalentRewards, selfCraftedTalentRewards, itemQualityLevelTalentRewards, slowXpGainTalentRewards, verySlowXpGainTalentRewards, questXpOnlyTalentRewards, ironManTalentRewards;
-    std::unordered_map<uint8, uint32> hardcoreAchievementReward, semiHardcoreAchievementReward, selfCraftedAchievementReward, itemQualityLevelAchievementReward, slowXpGainAchievementReward, verySlowXpGainAchievementReward, questXpOnlyAchievementReward, ironManAchievementReward;
+    std::unordered_map<uint8, std::vector<uint32>> hardcoreTitleRewards, semiHardcoreTitleRewards, selfCraftedTitleRewards, itemQualityLevelTitleRewards, slowXpGainTitleRewards, verySlowXpGainTitleRewards, questXpOnlyTitleRewards, ironManTitleRewards;
+    std::unordered_map<uint8, std::vector<uint32>> hardcoreItemRewards, semiHardcoreItemRewards, selfCraftedItemRewards, itemQualityLevelItemRewards, slowXpGainItemRewards, verySlowXpGainItemRewards, questXpOnlyItemRewards, ironManItemRewards;
+    std::unordered_map<uint8, std::vector<uint32>> hardcoreTalentRewards, semiHardcoreTalentRewards, selfCraftedTalentRewards, itemQualityLevelTalentRewards, slowXpGainTalentRewards, verySlowXpGainTalentRewards, questXpOnlyTalentRewards, ironManTalentRewards;
+    std::unordered_map<uint8, std::vector<uint32>> hardcoreAchievementReward, semiHardcoreAchievementReward, selfCraftedAchievementReward, itemQualityLevelAchievementReward, slowXpGainAchievementReward, verySlowXpGainAchievementReward, questXpOnlyAchievementReward, ironManAchievementReward;
 
-    std::unordered_map<std::string, std::unordered_map<uint8, uint32>*> rewardConfigMap =
+    std::unordered_map<std::string, std::unordered_map<uint8, std::vector<uint32>>*> rewardConfigMap =
             {
                     { "Hardcore.TitleRewards",                &hardcoreTitleRewards                 },
                     { "SemiHardcore.TitleRewards",            &semiHardcoreTitleRewards             },
@@ -94,11 +96,17 @@ public:
     [[nodiscard]] uint32 getDisableLevel(ChallengeModeSettings setting) const;
     [[nodiscard]] float getXpBonusForChallenge(ChallengeModeSettings setting) const;
     bool challengeEnabledForPlayer(ChallengeModeSettings setting, Player* player) const;
-    [[nodiscard]] const std::unordered_map<uint8, uint32> *getTitleMapForChallenge(ChallengeModeSettings setting) const;
-    [[nodiscard]] const std::unordered_map<uint8, uint32> *getTalentMapForChallenge(ChallengeModeSettings setting) const;
-    [[nodiscard]] const std::unordered_map<uint8, uint32> *getItemMapForChallenge(ChallengeModeSettings setting) const;
-    [[nodiscard]] const std::unordered_map<uint8, uint32> *getAchievementMapForChallenge(ChallengeModeSettings setting) const;
+    [[nodiscard]] const std::unordered_map<uint8, std::vector<uint32>> *getTitleMapForChallenge(ChallengeModeSettings setting) const;
+    [[nodiscard]] const std::unordered_map<uint8, std::vector<uint32>> *getTalentMapForChallenge(ChallengeModeSettings setting) const;
+    [[nodiscard]] const std::unordered_map<uint8, std::vector<uint32>> *getItemMapForChallenge(ChallengeModeSettings setting) const;
+    [[nodiscard]] const std::unordered_map<uint8, std::vector<uint32>> *getAchievementMapForChallenge(ChallengeModeSettings setting) const;
     [[nodiscard]] uint32 getItemRewardAmount(ChallengeModeSettings setting) const;
+    [[nodiscard]] bool HasAnyChallengeEnabled(Player* player) const;
+    void SyncCharacterRecord(Player* player) const;
+    void EnforceChallengeRestrictions(Player* player) const;
+
+private:
+    [[nodiscard]] uint32 BuildChallengeMask(Player* player) const;
 };
 
 #define sChallengeModes ChallengeModes::instance()

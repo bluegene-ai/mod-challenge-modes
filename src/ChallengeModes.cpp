@@ -3,6 +3,16 @@
  */
 
 #include "ChallengeModes.h"
+#include "DatabaseEnv.h"
+#include "Group.h"
+#include "GuildMgr.h"
+#include "WorldSession.h"
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <sstream>
+#include <utility>
+#include <vector>
 
 ChallengeModes* ChallengeModes::instance()
 {
@@ -97,7 +107,7 @@ float ChallengeModes::getXpBonusForChallenge(ChallengeModeSettings setting) cons
     return 1;
 }
 
-const std::unordered_map<uint8, uint32> *ChallengeModes::getTitleMapForChallenge(ChallengeModeSettings setting) const
+const std::unordered_map<uint8, std::vector<uint32>> *ChallengeModes::getTitleMapForChallenge(ChallengeModeSettings setting) const
 {
     switch (setting)
     {
@@ -123,7 +133,7 @@ const std::unordered_map<uint8, uint32> *ChallengeModes::getTitleMapForChallenge
     return {};
 }
 
-const std::unordered_map<uint8, uint32> *ChallengeModes::getTalentMapForChallenge(ChallengeModeSettings setting) const
+const std::unordered_map<uint8, std::vector<uint32>> *ChallengeModes::getTalentMapForChallenge(ChallengeModeSettings setting) const
 {
     switch (setting)
     {
@@ -149,7 +159,7 @@ const std::unordered_map<uint8, uint32> *ChallengeModes::getTalentMapForChalleng
     return {};
 }
 
-const std::unordered_map<uint8, uint32> *ChallengeModes::getItemMapForChallenge(ChallengeModeSettings setting) const
+const std::unordered_map<uint8, std::vector<uint32>> *ChallengeModes::getItemMapForChallenge(ChallengeModeSettings setting) const
 {
     switch (setting)
     {
@@ -201,7 +211,158 @@ uint32 ChallengeModes::getItemRewardAmount(ChallengeModeSettings setting) const
     return 0;
 }
 
-const std::unordered_map<uint8, uint32> *ChallengeModes::getAchievementMapForChallenge(ChallengeModeSettings setting) const
+uint32 ChallengeModes::BuildChallengeMask(Player* player) const
+{
+    if (!player)
+    {
+        return 0;
+    }
+
+    uint32 mask = 0;
+    for (uint32 idx = static_cast<uint32>(SETTING_HARDCORE); idx <= static_cast<uint32>(HARDCORE_DEAD); ++idx)
+    {
+        if (player->GetPlayerSetting("mod-challenge-modes", idx).value)
+        {
+            mask |= (1u << idx);
+        }
+    }
+
+    return mask;
+}
+
+bool ChallengeModes::HasAnyChallengeEnabled(Player* player) const
+{
+    if (!player)
+        return false;
+
+    // 只有challenge_mask>0才算启用
+    return BuildChallengeMask(player) > 0;
+}
+
+void ChallengeModes::SyncCharacterRecord(Player* player) const
+{
+    if (!player)
+    {
+        return;
+    }
+
+    uint32 const mask = BuildChallengeMask(player);
+    std::string name = player->GetName();
+    uint8 result = 0; // 0=进行中, 1=成功, 2=失败
+
+    // 极限模式死亡算失败
+    if (player->GetPlayerSetting("mod-challenge-modes", HARDCORE_DEAD).value == 1)
+        result = 2;
+    // 所有挑战关闭，视为完成
+    else if (mask == 0)
+        result = 1;
+
+    // 只在以下两种情况写入：
+    // 1. mask>0（进行中/失败）
+    // 2. mask==0，但数据库已存在该guid（完成）
+    // 检查是否首次写入（无历史挑战）
+    QueryResult resultCheck = CharacterDatabase.Query("SELECT start_time FROM challenge_mode_characters WHERE guid = '{}' LIMIT 1", player->GetGUID().GetCounter());
+    if (mask > 0)
+    {
+        if (!resultCheck)
+        {
+            // 首次写入，记录start_time和updated_at
+            CharacterDatabase.Execute(
+                "INSERT INTO challenge_mode_characters (guid, name, challenge_mask, result, start_time, updated_at) VALUES('{}', '{}', {}, {}, NOW(), NOW())",
+                player->GetGUID().GetCounter(), name, mask, result);
+        }
+        else
+        {
+            // 后续更新，只更新updated_at
+            CharacterDatabase.Execute(
+                "UPDATE challenge_mode_characters SET name='{}', challenge_mask={}, result={}, updated_at=NOW() WHERE guid='{}'",
+                name, mask, result, player->GetGUID().GetCounter());
+        }
+    }
+    else
+    {
+        // mask==0，只有有历史挑战才写入（即完成/失败）
+        if (resultCheck)
+        {
+            CharacterDatabase.Execute(
+                "UPDATE challenge_mode_characters SET name='{}', challenge_mask=0, result={}, updated_at=NOW() WHERE guid='{}'",
+                name, result, player->GetGUID().GetCounter());
+        }
+        // 否则（mask==0且无历史挑战），不写入
+    }
+}
+
+void ChallengeModes::EnforceChallengeRestrictions(Player* player) const
+{
+    if (!player)
+        return;
+
+    // 只有challenge_mask>0时才限制
+    uint32 mask = BuildChallengeMask(player);
+    if (mask == 0)
+        return;
+
+    if (Group* group = player->GetGroup())
+    {
+        player->RemoveFromGroup(GROUP_REMOVEMETHOD_KICK);
+        if (WorldSession* session = player->GetSession())
+        {
+            ChatHandler(session).SendNotification("挑战模式角色不能组队。");
+        }
+    }
+
+    if (player->GetGuildId())
+    {
+        if (Guild* guild = sGuildMgr->GetGuildById(player->GetGuildId()))
+        {
+            guild->DeleteMember(player->GetGUID(), false, true);
+        }
+        if (WorldSession* session = player->GetSession())
+        {
+            ChatHandler(session).SendNotification("挑战模式角色不能加入工会。");
+        }
+    }
+
+    if (player->GetTradeData())
+    {
+        player->TradeCancel(true);
+    }
+
+    // 自动移除已装备的传家宝品质物品：优先放回背包，若放不下则通过邮件回收
+    for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+    {
+        Item* pItem = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+        if (!pItem)
+            continue;
+        ItemTemplate const* proto = pItem->GetTemplate();
+        if (!proto)
+            continue;
+        if (proto->Quality != ITEM_QUALITY_HEIRLOOM)
+            continue;
+
+        // 尝试移动到玩家空包裹位置
+        ItemPosCountVec dest;
+        InventoryResult res = player->CanStoreItem(NULL_BAG, NULL_SLOT, dest, pItem, false);
+        if (res == EQUIP_ERR_OK)
+        {
+            player->MoveItemToInventory(dest, pItem, true);
+            if (WorldSession* session = player->GetSession())
+                ChatHandler(session).PSendSysMessage("传家宝已从装备移回背包以符合挑战规则。");
+        }
+        else
+        {
+            // 通过邮件回收：发送物品条目和数量
+            uint32 entry = pItem->GetEntry();
+            uint32 count = pItem->GetCount();
+            player->DestroyItem(pItem->GetBagSlot(), pItem->GetSlot(), true);
+            player->SendItemRetrievalMail({ { entry, count } });
+            if (WorldSession* session = player->GetSession())
+                ChatHandler(session).PSendSysMessage("背包已满，传家宝已通过邮件回收。请从邮箱领取。");
+        }
+    }
+}
+
+const std::unordered_map<uint8, std::vector<uint32>> *ChallengeModes::getAchievementMapForChallenge(ChallengeModeSettings setting) const
 {
     switch (setting)
     {
@@ -240,21 +401,62 @@ public:
     }
 
 private:
-    static void LoadStringToMap(std::unordered_map<uint8, uint32> &mapToLoad, const std::string &configString)
+    // 配置项格式：等级 数值，多组以逗号分隔。同一等级的多组数值全部保留。
+    static bool ParseRewardEntry(std::string const& entry, uint8& level, uint32& value)
     {
-        std::string delimitedValue;
-        std::stringstream configIdStream;
+        std::stringstream entryStream(entry);
+        std::string levelToken;
+        std::string valueToken;
+        if (!(entryStream >> levelToken >> valueToken))
+        {
+            return false;
+        }
 
-        configIdStream.str(configString);
-        // Process each config ID in the string, delimited by the comma - "," and then space " "
+        char* end = nullptr;
+        unsigned long const parsedLevel = std::strtoul(levelToken.c_str(), &end, 10);
+        if (!end || *end != '\0' || parsedLevel == 0 || parsedLevel > 255)
+        {
+            return false;
+        }
+
+        end = nullptr;
+        unsigned long const parsedValue = std::strtoul(valueToken.c_str(), &end, 10);
+        if (!end || *end != '\0')
+        {
+            return false;
+        }
+
+        level = static_cast<uint8>(parsedLevel);
+        value = static_cast<uint32>(parsedValue);
+        return true;
+    }
+
+    static bool IsBlank(std::string const& text)
+    {
+        return std::all_of(text.begin(), text.end(), [](unsigned char character) { return std::isspace(character) != 0; });
+    }
+
+    static void LoadStringToMap(std::unordered_map<uint8, std::vector<uint32>>& mapToLoad, std::string const& configString)
+    {
+        std::stringstream configIdStream(configString);
+        std::string delimitedValue;
+
         while (std::getline(configIdStream, delimitedValue, ','))
         {
-            std::string pairOne, pairTwo;
-            std::stringstream configPairStream(delimitedValue);
-            configPairStream>>pairOne>>pairTwo;
-            auto configLevel = atoi(pairOne.c_str());
-            auto rewardValue = atoi(pairTwo.c_str());
-            mapToLoad[configLevel] = rewardValue;
+            if (IsBlank(delimitedValue))
+            {
+                continue;
+            }
+
+            uint8 level = 0;
+            uint32 value = 0;
+            if (!ParseRewardEntry(delimitedValue, level, value))
+            {
+                LOG_ERROR("mod-challenge-modes", "奖励配置 '{}' 格式无效，已忽略。", delimitedValue);
+                continue;
+            }
+
+            mapToLoad[level].push_back(value);
         }
     }
 
@@ -304,15 +506,6 @@ private:
             sChallengeModes->verySlowXpGainItemRewardAmount   = sConfigMgr->GetOption<uint32>("VerySlowXpGain.ItemRewardAmount", 1);
             sChallengeModes->questXpOnlyItemRewardAmount      = sConfigMgr->GetOption<uint32>("QuestXpOnly.ItemRewardAmount", 1);
             sChallengeModes->ironManItemRewardAmount          = sConfigMgr->GetOption<uint32>("IronMan.ItemRewardAmount", 1);
-
-            LoadStringToMap(sChallengeModes->hardcoreAchievementReward, sConfigMgr->GetOption<std::string>("Hardcore.AchievementReward", ""));
-            LoadStringToMap(sChallengeModes->semiHardcoreAchievementReward, sConfigMgr->GetOption<std::string>("SemiHardcore.AchievementReward", ""));
-            LoadStringToMap(sChallengeModes->selfCraftedAchievementReward, sConfigMgr->GetOption<std::string>("SelfCrafted.AchievementReward", ""));
-            LoadStringToMap(sChallengeModes->itemQualityLevelAchievementReward, sConfigMgr->GetOption<std::string>("ItemQualityLevel.AchievementReward", ""));
-            LoadStringToMap(sChallengeModes->slowXpGainAchievementReward, sConfigMgr->GetOption<std::string>("SlowXpGain.AchievementReward", ""));
-            LoadStringToMap(sChallengeModes->verySlowXpGainAchievementReward, sConfigMgr->GetOption<std::string>("VerySlowXpGain.AchievementReward", ""));
-            LoadStringToMap(sChallengeModes->questXpOnlyAchievementReward, sConfigMgr->GetOption<std::string>("QuestXpOnly.AchievementReward", ""));
-            LoadStringToMap(sChallengeModes->ironManAchievementReward, sConfigMgr->GetOption<std::string>("IronMan.AchievementReward", ""));
         }
     }
 };
@@ -325,9 +518,9 @@ public:
             : PlayerScript(scriptName), settingName(settingName)
     { }
 
-    static bool mapContainsKey(const std::unordered_map<uint8, uint32>* mapToCheck, uint8 key)
+    static bool mapContainsKey(const std::unordered_map<uint8, std::vector<uint32>>* mapToCheck, uint8 key)
     {
-        return (mapToCheck->find(key) != mapToCheck->end());
+        return mapToCheck && mapToCheck->find(key) != mapToCheck->end();
     }
 
     void OnPlayerGiveXP(Player* player, uint32& amount, Unit* /*victim*/, uint8 /*xpSource*/) override
@@ -339,64 +532,90 @@ public:
         amount *= sChallengeModes->getXpBonusForChallenge(settingName);
     }
 
-void OnPlayerLevelChanged(Player* player, uint8 /*oldlevel*/) override
-{
-    if (!sChallengeModes->challengeEnabledForPlayer(settingName, player))
+    void OnPlayerLevelChanged(Player* player, uint8 /*oldlevel*/) override
     {
-        return;
-    }
-
-    const std::unordered_map<uint8, uint32>* titleRewardMap = sChallengeModes->getTitleMapForChallenge(settingName);
-    const std::unordered_map<uint8, uint32>* talentRewardMap = sChallengeModes->getTalentMapForChallenge(settingName);
-    const std::unordered_map<uint8, uint32>* itemRewardMap = sChallengeModes->getItemMapForChallenge(settingName);
-    const std::unordered_map<uint8, uint32>* achievementRewardMap = sChallengeModes->getAchievementMapForChallenge(settingName);
-    uint8 level = player->GetLevel();
-
-    if (mapContainsKey(titleRewardMap, level))
-    {
-        CharTitlesEntry const* titleInfo = sCharTitlesStore.LookupEntry(titleRewardMap->at(level));
-        if (!titleInfo)
+        if (!sChallengeModes->challengeEnabledForPlayer(settingName, player))
         {
-            LOG_ERROR("mod-challenge-modes", "Invalid title ID {}!", titleRewardMap->at(level));
-            return;
-        }
-        ChatHandler handler(player->GetSession());
-        std::string tNameLink = handler.GetNameLink(player);
-        std::string titleNameStr = Acore::StringFormat(player->getGender() == GENDER_MALE ? titleInfo->nameMale[handler.GetSessionDbcLocale()] : titleInfo->nameFemale[handler.GetSessionDbcLocale()], player->GetName());
-        player->SetTitle(titleInfo);
-    }
-
-    if (mapContainsKey(talentRewardMap, level))
-    {
-        player->RewardExtraBonusTalentPoints(talentRewardMap->at(level));
-    }
-
-    if (mapContainsKey(achievementRewardMap, level))
-    {
-        AchievementEntry const* achievementInfo = sAchievementStore.LookupEntry(achievementRewardMap->at(level));
-        if (!achievementInfo)
-        {
-            LOG_ERROR("mod-challenge-modes", "Invalid Achievement ID {}!", achievementRewardMap->at(level));
             return;
         }
 
-        ChatHandler handler(player->GetSession());
-        std::string tNameLink = handler.GetNameLink(player);
-        player->CompletedAchievement(achievementInfo);
-    }
+        using RewardMap = std::unordered_map<uint8, std::vector<uint32>>;
 
-    if (mapContainsKey(itemRewardMap, level))
-    {
-        uint32 itemEntry = itemRewardMap->at(level);
-        uint32 itemAmount = sChallengeModes->getItemRewardAmount(settingName); // Fetch item amount from config
-        player->SendItemRetrievalMail({ { itemEntry, itemAmount } });
-    }
+        RewardMap const* titleRewardMap = sChallengeModes->getTitleMapForChallenge(settingName);
+        RewardMap const* talentRewardMap = sChallengeModes->getTalentMapForChallenge(settingName);
+        RewardMap const* itemRewardMap = sChallengeModes->getItemMapForChallenge(settingName);
+        RewardMap const* achievementRewardMap = sChallengeModes->getAchievementMapForChallenge(settingName);
+        uint8 level = player->GetLevel();
 
-    if (sChallengeModes->getDisableLevel(settingName) && sChallengeModes->getDisableLevel(settingName) <= level)
-    {
-        player->UpdatePlayerSetting("mod-challenge-modes", settingName, 0);
+        if (mapContainsKey(titleRewardMap, level))
+        {
+            for (uint32 titleId : titleRewardMap->at(level))
+            {
+                CharTitlesEntry const* titleInfo = sCharTitlesStore.LookupEntry(titleId);
+                if (!titleInfo)
+                {
+                    LOG_ERROR("mod-challenge-modes", "无效的称号 ID {}！", titleId);
+                    continue;
+                }
+
+                player->SetTitle(titleInfo);
+            }
+        }
+
+        if (mapContainsKey(talentRewardMap, level))
+        {
+            uint32 talentPoints = 0;
+            for (uint32 points : talentRewardMap->at(level))
+            {
+                talentPoints += points;
+            }
+
+            if (talentPoints)
+            {
+                player->RewardExtraBonusTalentPoints(talentPoints);
+            }
+        }
+
+        if (mapContainsKey(achievementRewardMap, level))
+        {
+            for (uint32 achievementId : achievementRewardMap->at(level))
+            {
+                AchievementEntry const* achievementInfo = sAchievementStore.LookupEntry(achievementId);
+                if (!achievementInfo)
+                {
+                    LOG_ERROR("mod-challenge-modes", "无效的成就 ID {}！", achievementId);
+                    continue;
+                }
+
+                player->CompletedAchievement(achievementInfo);
+            }
+        }
+
+        if (mapContainsKey(itemRewardMap, level))
+        {
+            uint32 itemAmount = sChallengeModes->getItemRewardAmount(settingName);
+            std::vector<std::pair<uint32, uint32>> mailItems;
+
+            if (itemAmount)
+            {
+                for (uint32 itemEntry : itemRewardMap->at(level))
+                {
+                    mailItems.emplace_back(itemEntry, itemAmount);
+                }
+            }
+
+            if (!mailItems.empty())
+            {
+                player->SendItemRetrievalMail(mailItems);
+            }
+        }
+
+        if (sChallengeModes->getDisableLevel(settingName) && sChallengeModes->getDisableLevel(settingName) <= level)
+        {
+            player->UpdatePlayerSetting("mod-challenge-modes", settingName, 0);
+            sChallengeModes->SyncCharacterRecord(player);
+        }
     }
-}
 
 private:
     ChallengeModeSettings settingName;
@@ -424,6 +643,8 @@ public:
             return;
         }
         player->UpdatePlayerSetting("mod-challenge-modes", HARDCORE_DEAD, 1);
+        sChallengeModes->SyncCharacterRecord(player);
+        sChallengeModes->EnforceChallengeRestrictions(player);
         player->GetSession()->KickPlayer(std::string("极限模式角色已死亡"));
     }
 
@@ -434,6 +655,8 @@ public:
             return;
         }
         killed->UpdatePlayerSetting("mod-challenge-modes", HARDCORE_DEAD, 1);
+        sChallengeModes->SyncCharacterRecord(killed);
+        sChallengeModes->EnforceChallengeRestrictions(killed);
     }
 
     void OnPlayerKilledByCreature(Creature* /*killer*/, Player* killed) override
@@ -443,9 +666,11 @@ public:
             return;
         }
         killed->UpdatePlayerSetting("mod-challenge-modes", HARDCORE_DEAD, 1);
+        sChallengeModes->SyncCharacterRecord(killed);
+        sChallengeModes->EnforceChallengeRestrictions(killed);
     }
 
-    void OnPlayerResurrect(Player* player, float /*restore_percent*/, bool /*applySickness*/) override
+    void OnPlayerResurrect(Player* player, float /*restore_percent*/, bool& /*applySickness*/) override
     {
         if (!sChallengeModes->challengeEnabledForPlayer(SETTING_HARDCORE, player))
         {
@@ -453,6 +678,8 @@ public:
         }
         // A better implementation is to not allow the resurrect but this will need a new hook added first
         player->UpdatePlayerSetting("mod-challenge-modes", HARDCORE_DEAD, 1);
+        sChallengeModes->SyncCharacterRecord(player);
+        sChallengeModes->EnforceChallengeRestrictions(player);
         player->KillPlayer();
         player->GetSession()->KickPlayer(std::string("极限模式角色已死亡"));
     }
@@ -511,14 +738,27 @@ public:
 
     bool OnPlayerCanEquipItem(Player* player, uint8 /*slot*/, uint16& /*dest*/, Item* pItem, bool /*swap*/, bool /*not_loading*/) override
     {
-        if (!sChallengeModes->challengeEnabledForPlayer(SETTING_SELF_CRAFTED, player))
-        {
+        if (!player || !pItem)
             return true;
-        }
-        if (!pItem->GetTemplate()->HasSignature())
+
+        // 统一规则：任何挑战进行中（mask>0）时，不允许装备传家宝品质物品
+        if (sChallengeModes->HasAnyChallengeEnabled(player))
         {
-            return false;
+            ItemTemplate const* proto = pItem->GetTemplate();
+            if (proto && proto->Quality == ITEM_QUALITY_HEIRLOOM)
+            {
+                if (WorldSession* session = player->GetSession())
+                    ChatHandler(session).SendNotification("挑战进行中不可装备传家宝物品。");
+                return false;
+            }
         }
+
+        if (!sChallengeModes->challengeEnabledForPlayer(SETTING_SELF_CRAFTED, player))
+            return true;
+
+        if (!pItem->GetTemplate()->HasSignature())
+            return false;
+
         return pItem->GetGuidValue(ITEM_FIELD_CREATOR) == player->GetGUID();
     }
 
@@ -540,10 +780,23 @@ public:
 
     bool OnPlayerCanEquipItem(Player* player, uint8 /*slot*/, uint16& /*dest*/, Item* pItem, bool /*swap*/, bool /*not_loading*/) override
     {
-        if (!sChallengeModes->challengeEnabledForPlayer(SETTING_ITEM_QUALITY_LEVEL, player))
-        {
+        if (!player || !pItem)
             return true;
+
+        if (sChallengeModes->HasAnyChallengeEnabled(player))
+        {
+            ItemTemplate const* proto = pItem->GetTemplate();
+            if (proto && proto->Quality == ITEM_QUALITY_HEIRLOOM)
+            {
+                if (WorldSession* session = player->GetSession())
+                    ChatHandler(session).SendNotification("挑战进行中不可装备传家宝物品。");
+                return false;
+            }
         }
+
+        if (!sChallengeModes->challengeEnabledForPlayer(SETTING_ITEM_QUALITY_LEVEL, player))
+            return true;
+
         return pItem->GetTemplate()->Quality <= ITEM_QUALITY_NORMAL;
     }
 
@@ -626,7 +879,7 @@ class ChallengeMode_IronMan : public ChallengeMode
 public:
     ChallengeMode_IronMan() : ChallengeMode("ChallengeMode_IronMan", SETTING_IRON_MAN) {}
 
-    void OnPlayerResurrect(Player* player, float /*restore_percent*/, bool /*applySickness*/) override
+    void OnPlayerResurrect(Player* player, float /*restore_percent*/, bool& /*applySickness*/) override
     {
         if (!sChallengeModes->challengeEnabledForPlayer(SETTING_IRON_MAN, player))
         {
@@ -662,10 +915,23 @@ public:
 
     bool OnPlayerCanEquipItem(Player* player, uint8 /*slot*/, uint16& /*dest*/, Item* pItem, bool /*swap*/, bool /*not_loading*/) override
     {
-        if (!sChallengeModes->challengeEnabledForPlayer(SETTING_IRON_MAN, player))
-        {
+        if (!player || !pItem)
             return true;
+
+        if (sChallengeModes->HasAnyChallengeEnabled(player))
+        {
+            ItemTemplate const* proto = pItem->GetTemplate();
+            if (proto && proto->Quality == ITEM_QUALITY_HEIRLOOM)
+            {
+                if (WorldSession* session = player->GetSession())
+                    ChatHandler(session).SendNotification("挑战进行中不可装备传家宝物品。");
+                return false;
+            }
         }
+
+        if (!sChallengeModes->challengeEnabledForPlayer(SETTING_IRON_MAN, player))
+            return true;
+
         return pItem->GetTemplate()->Quality <= ITEM_QUALITY_NORMAL;
     }
 
@@ -768,6 +1034,106 @@ public:
 
 };
 
+class ChallengeMode_GlobalRestrictions : public PlayerScript
+{
+public:
+    ChallengeMode_GlobalRestrictions() : PlayerScript("ChallengeMode_GlobalRestrictions") { }
+
+    bool OnPlayerCanGroupInvite(Player* player, std::string& /*membername*/) override
+    {
+        if (!sChallengeModes->HasAnyChallengeEnabled(player))
+        {
+            return true;
+        }
+
+        if (WorldSession* session = player->GetSession())
+        {
+            ChatHandler(session).SendNotification("挑战模式角色不能组队。");
+        }
+
+        return false;
+    }
+
+    bool OnPlayerCanGroupAccept(Player* player, Group* /*group*/) override
+    {
+        if (!sChallengeModes->HasAnyChallengeEnabled(player))
+        {
+            return true;
+        }
+
+        if (WorldSession* session = player->GetSession())
+        {
+            ChatHandler(session).SendNotification("挑战模式角色不能组队。");
+        }
+
+        return false;
+    }
+
+    bool OnPlayerCanInitTrade(Player* player, Player* target) override
+    {
+        if (!player || !target)
+        {
+            return true;
+        }
+
+        if (!sChallengeModes->HasAnyChallengeEnabled(player) && !sChallengeModes->HasAnyChallengeEnabled(target))
+        {
+            return true;
+        }
+
+        if (WorldSession* session = player->GetSession())
+        {
+            ChatHandler(session).SendNotification("挑战模式角色不能进行交易。");
+        }
+
+        if (WorldSession* targetSession = target->GetSession())
+        {
+            ChatHandler(targetSession).SendNotification("挑战模式角色不能进行交易。");
+        }
+
+        return false;
+    }
+
+    bool OnPlayerCanEquipItem(Player* player, uint8 /*slot*/, uint16& /*dest*/, Item* pItem, bool /*swap*/, bool /*not_loading*/) override
+    {
+        if (!player || !pItem)
+        {
+            return true;
+        }
+
+        if (!sChallengeModes->HasAnyChallengeEnabled(player))
+        {
+            return true;
+        }
+
+        if (ItemTemplate const* proto = pItem->GetTemplate())
+        {
+            if (proto->Quality == ITEM_QUALITY_HEIRLOOM)
+            {
+                player->SendEquipError(EQUIP_ERR_YOU_CAN_NEVER_USE_THAT_ITEM, pItem, nullptr);
+                if (WorldSession* session = player->GetSession())
+                {
+                    ChatHandler(session).SendNotification("挑战模式角色不能装备传家宝物品。");
+                }
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void OnPlayerLogin(Player* player) override
+    {
+        sChallengeModes->SyncCharacterRecord(player);
+        sChallengeModes->EnforceChallengeRestrictions(player);
+    }
+
+    void OnPlayerLogout(Player* player) override
+    {
+        sChallengeModes->SyncCharacterRecord(player);
+    }
+};
+
 class gobject_challenge_modes : public GameObjectScript
 {
 private:
@@ -797,7 +1163,7 @@ public:
     {
         if (sChallengeModes->challengeEnabled(SETTING_HARDCORE) && !playerSettingEnabled(player, SETTING_HARDCORE) && !playerSettingEnabled(player, SETTING_SEMI_HARDCORE))
         {
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用极限模式", 0, SETTING_HARDCORE);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用一命模式，该角色死亡后将无法再次登录服务器。", 0, SETTING_HARDCORE);
         }
         if (sChallengeModes->challengeEnabled(SETTING_SEMI_HARDCORE) && !playerSettingEnabled(player, SETTING_HARDCORE) && !playerSettingEnabled(player, SETTING_SEMI_HARDCORE))
         {
@@ -805,27 +1171,27 @@ public:
         }
         if (sChallengeModes->challengeEnabled(SETTING_SELF_CRAFTED) && !playerSettingEnabled(player, SETTING_SELF_CRAFTED) && !playerSettingEnabled(player, SETTING_IRON_MAN))
         {
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用自制装备模式", 0, SETTING_SELF_CRAFTED);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用自制装备模式，你只能使用自己制作的装备。", 0, SETTING_SELF_CRAFTED);
         }
         if (sChallengeModes->challengeEnabled(SETTING_ITEM_QUALITY_LEVEL) && !playerSettingEnabled(player, SETTING_ITEM_QUALITY_LEVEL))
         {
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用低品质装备模式", 0, SETTING_ITEM_QUALITY_LEVEL);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用低品质装备模式，你只能使用白色和灰色品质的装备。", 0, SETTING_ITEM_QUALITY_LEVEL);
         }
         if (sChallengeModes->challengeEnabled(SETTING_SLOW_XP_GAIN) && !playerSettingEnabled(player, SETTING_SLOW_XP_GAIN) && !playerSettingEnabled(player, SETTING_VERY_SLOW_XP_GAIN))
         {
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用慢速经验模式", 0, SETTING_SLOW_XP_GAIN);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用慢速经验模式，经验获取速度减慢为0.5倍。", 0, SETTING_SLOW_XP_GAIN);
         }
         if (sChallengeModes->challengeEnabled(SETTING_VERY_SLOW_XP_GAIN) && !playerSettingEnabled(player, SETTING_SLOW_XP_GAIN) && !playerSettingEnabled(player, SETTING_VERY_SLOW_XP_GAIN))
         {
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用极慢经验模式", 0, SETTING_VERY_SLOW_XP_GAIN);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用极慢经验模式，经验获取速度减慢为0.25倍。", 0, SETTING_VERY_SLOW_XP_GAIN);
         }
         if (sChallengeModes->challengeEnabled(SETTING_QUEST_XP_ONLY) && !playerSettingEnabled(player, SETTING_QUEST_XP_ONLY))
         {
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用任务经验专属模式", 0, SETTING_QUEST_XP_ONLY);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用任务经验专属模式，你只能通过任务获得经验。", 0, SETTING_QUEST_XP_ONLY);
         }
         if (sChallengeModes->challengeEnabled(SETTING_IRON_MAN) && !playerSettingEnabled(player, SETTING_IRON_MAN) && !playerSettingEnabled(player, SETTING_SELF_CRAFTED))
         {
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用铁人模式", 0, SETTING_IRON_MAN);
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "启用铁人模式，为自己祈祷吧，阿门。", 0, SETTING_IRON_MAN);
         }
         SendGossipMenuFor(player, 12669, go->GetGUID());
         return true;
@@ -833,7 +1199,30 @@ public:
 
     bool OnGossipSelect(Player* player, GameObject* /*go*/, uint32 /*sender*/, uint32 action) override
     {
+        if (!player)
+            return false;
+
+        // 启用前检查：如果装备了任意传家宝品质装备则不允许开启挑战模式
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            Item* pItem = player->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (!pItem)
+                continue;
+            ItemTemplate const* proto = pItem->GetTemplate();
+            if (!proto)
+                continue;
+            if (proto->Quality == ITEM_QUALITY_HEIRLOOM)
+            {
+                if (WorldSession* session = player->GetSession())
+                    ChatHandler(session).PSendSysMessage("无法启用挑战模式：你装备了传家宝物品，请先卸下。");
+                CloseGossipMenuFor(player);
+                return true;
+            }
+        }
+
         player->UpdatePlayerSetting("mod-challenge-modes", action, 1);
+        sChallengeModes->SyncCharacterRecord(player);
+        sChallengeModes->EnforceChallengeRestrictions(player);
         ChatHandler(player->GetSession()).PSendSysMessage("挑战模式已启用。");
         CloseGossipMenuFor(player);
         return true;
@@ -850,6 +1239,7 @@ void AddSC_mod_challenge_modes()
 {
     new ChallengeModes_WorldScript();
     new gobject_challenge_modes();
+    new ChallengeMode_GlobalRestrictions();
     new ChallengeMode_Hardcore();
     new ChallengeMode_SemiHardcore();
     new ChallengeMode_SelfCrafted();
